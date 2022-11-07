@@ -135,7 +135,7 @@ pub(crate) fn get_jit_args<'a>(
     func: &PyFunction,
     func_args: &FuncArgs,
     jitted_code: &'a CompiledCode,
-    vm: &VirtualMachine,
+    vm: &'a VirtualMachine,
 ) -> Result<Args<'a>, ArgsError> {
     let mut jit_args = jitted_code.args_builder();
     let nargs = func_args.args.len();
@@ -144,6 +144,12 @@ pub(crate) fn get_jit_args<'a>(
     if nargs > func.code.arg_count || nargs < func.code.posonlyarg_count {
         return Err(ArgsError::WrongNumberOfArgs);
     }
+
+    // Register the VmCtx
+    jit_args.set_vmctx(vm);
+    dbg!(nargs);
+    dbg!(func.code.arg_count);
+    dbg!(func.code.posonlyarg_count);
 
     // Add positional arguments
     for i in 0..nargs {
@@ -195,6 +201,8 @@ pub(crate) fn get_jit_args<'a>(
             }
         }
     }
+
+    println!("Hello! Into Args");
 
     jit_args.into_args().ok_or(ArgsError::NotAllArgsPassed)
 }

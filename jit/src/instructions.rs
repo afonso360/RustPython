@@ -1,4 +1,12 @@
-use cranelift::prelude::*;
+use cranelift::{
+    codegen::{
+        dbg,
+        ir::{AbiParam, ArgumentPurpose, SigRef, Signature, UserExternalName, UserExternalNameRef},
+    },
+    prelude::{isa::CallConv, types::*, *},
+};
+use cranelift_jit::JITModule;
+use cranelift_module::Module;
 use num_traits::cast::ToPrimitive;
 use rustpython_compiler_core::{
     self as bytecode, BinaryOperator, BorrowedConstant, CodeObject, ComparisonOperator,
@@ -28,6 +36,7 @@ impl JitValue {
 
 pub struct FunctionCompiler<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
+    module: &'a mut JITModule,
     stack: Vec<JitValue>,
     variables: Box<[Option<Local>]>,
     label_to_block: HashMap<Label, Block>,
@@ -37,19 +46,31 @@ pub struct FunctionCompiler<'a, 'b> {
 impl<'a, 'b> FunctionCompiler<'a, 'b> {
     pub fn new(
         builder: &'a mut FunctionBuilder<'b>,
+        module: &'a mut JITModule,
         num_variables: usize,
         arg_types: &[JitType],
         entry_block: Block,
     ) -> FunctionCompiler<'a, 'b> {
+        println!("FunctionCompiler: {:?}", arg_types);
+        dbg!(num_variables);
+        let sig = JitSig {
+            args: {
+                let mut args = vec![];
+                // Functions always have the VM as the first argument.
+                args.push(JitType::VmCtxRef);
+                args.extend_from_slice(arg_types);
+                args
+            },
+            ret: None,
+        };
+
         let mut compiler = FunctionCompiler {
             builder,
+            module,
             stack: Vec::new(),
             variables: vec![None; num_variables].into_boxed_slice(),
             label_to_block: HashMap::new(),
-            sig: JitSig {
-                args: arg_types.to_vec(),
-                ret: None,
-            },
+            sig,
         };
         let params = compiler.builder.func.dfg.block_params(entry_block).to_vec();
         for (i, (ty, val)) in arg_types.iter().zip(params).enumerate() {
@@ -90,7 +111,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 let val = self.builder.ins().fcmp(FloatCC::NotEqual, val.val, zero);
                 Ok(self.builder.ins().bint(types::I8, val))
             }
-            JitType::Int => {
+            JitType::Int | JitType::PyRef | JitType::VmCtxRef => {
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 let val = self.builder.ins().icmp(IntCC::NotEqual, val.val, zero);
                 Ok(self.builder.ins().bint(types::I8, val))
@@ -140,6 +161,8 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
             self.add_instruction(instruction, &bytecode.constants)?;
         }
+
+        dbg!(&self.builder.func);
 
         Ok(())
     }
@@ -402,6 +425,67 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             Instruction::SetupLoop { .. } | Instruction::PopBlock => {
                 // TODO: block support
                 Ok(())
+            }
+
+            Instruction::LoadGlobal(id) => {
+                let id = self.builder.ins().iconst(I32, *id as i64);
+                let signature = self.builder.import_signature(Signature {
+                    params: vec![
+                        // VM Ctx
+                        // AbiParam::special(I64, ArgumentPurpose::VMContext),
+                        AbiParam::new(I64),
+                        // Global Id
+                        AbiParam::new(I32),
+                    ],
+                    returns: vec![
+                        // Global Ptr
+                        AbiParam::new(I64),
+                    ],
+
+                    call_conv: dbg!(CallConv::triple_default(self.module.isa().triple())),
+                });
+                let name = self
+                    .builder
+                    .func
+                    .params
+                    .ensure_user_func_name(UserExternalName {
+                        namespace: 0,
+                        index: 0,
+                    });
+                // let fref = self.builder.import_function(ExtFuncData {
+                //     name: ExternalName::User(name),
+                //     signature,
+                //     colocated: false,
+                // });
+
+                let vmctx = self
+                    .builder
+                    .func
+                    .special_param(ArgumentPurpose::VMContext)
+                    .unwrap();
+
+                let jit_rt_get_global = super::runtime::jit_rt_get_global as *const ();
+                let func_ptr = self.builder.ins().iconst(I64, jit_rt_get_global as i64);
+
+                let call = self
+                    .builder
+                    .ins()
+                    .call_indirect(signature, func_ptr, &[vmctx, id]);
+                let results = self.builder.inst_results(call);
+                assert_eq!(results.len(), 1);
+                let global = results[0];
+                self.stack.push(JitValue::new(global, JitType::Int));
+                println!("LoadGlobal");
+                // Err(JitCompileError::NotSupported)
+                Ok(())
+            }
+
+            Instruction::CallFunctionPositional { nargs } => {
+                println!("Callfunc");
+                dbg!(nargs);
+                dbg!(&self.stack);
+                Ok(())
+                // Err(JitCompileError::NotSupported)
             }
             _ => Err(JitCompileError::NotSupported),
         }

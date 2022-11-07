@@ -11,6 +11,7 @@ autotests = false
 
 [dependencies]
 rustpython-compiler-core = { path = "../compiler/core", version = "0.1.2" }
+# rustpython-vm = { path = "../vm", version = "0.1.2" }
 
 cranelift = "0.88.0"
 cranelift-jit = "0.88.0"

@@ -7,6 +7,24 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug lmao.py",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--package=rustpython",
+                    "--features=jit"
+                ],
+            },
+            "preLaunchTask": "Build RustPython Debug",
+            "program": "target/debug/rustpython",
+            "args": [
+                "./lmao.py"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug executable 'rustpython'",
             "cargo": {
                 "args": [

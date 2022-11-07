@@ -1,11 +1,16 @@
 mod instructions;
 
-use cranelift::prelude::*;
+use cranelift::{
+    codegen::ir::ArgumentPurpose,
+    prelude::{types::I64, *},
+};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
 use instructions::FunctionCompiler;
 use rustpython_compiler_core as bytecode;
 use std::{fmt, mem::ManuallyDrop};
+
+pub(crate) mod runtime;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -50,12 +55,18 @@ impl Jit {
         bytecode: &bytecode::CodeObject<C>,
         args: &[JitType],
     ) -> Result<(FuncId, JitSig), JitCompileError> {
-        for arg in args {
-            self.ctx
-                .func
-                .signature
-                .params
-                .push(AbiParam::new(arg.to_cranelift()));
+        let mut fn_args = vec![];
+        // Add a VMCtx param to all functions as the first argument.
+        fn_args.push(JitType::VmCtxRef);
+        // Now add the rest of the arguments.
+        fn_args.extend_from_slice(args);
+
+        // Register the arguments into the cranelift func signature.
+        for arg in &fn_args {
+            self.ctx.func.signature.params.push(match arg {
+                JitType::VmCtxRef => AbiParam::special(I64, ArgumentPurpose::VMContext),
+                arg => AbiParam::new(arg.to_cranelift()),
+            });
         }
 
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
@@ -64,8 +75,13 @@ impl Jit {
         builder.switch_to_block(entry_block);
 
         let sig = {
-            let mut compiler =
-                FunctionCompiler::new(&mut builder, bytecode.varnames.len(), args, entry_block);
+            let mut compiler = FunctionCompiler::new(
+                &mut builder,
+                &mut self.module,
+                bytecode.varnames.len(),
+                args,
+                entry_block,
+            );
 
             compiler.compile(bytecode)?;
 
@@ -119,10 +135,12 @@ impl CompiledCode {
     }
 
     pub fn invoke(&self, args: &[AbiValue]) -> Result<Option<AbiValue>, JitArgumentError> {
+        println!("INVOKE:!");
         if self.sig.args.len() != args.len() {
             return Err(JitArgumentError::WrongNumberOfArguments);
         }
 
+        dbg!(&args);
         let cif_args = self
             .sig
             .args
@@ -135,6 +153,7 @@ impl CompiledCode {
     }
 
     unsafe fn invoke_raw(&self, cif_args: &[libffi::middle::Arg]) -> Option<AbiValue> {
+        dbg!(cif_args);
         let cif = self.sig.to_cif();
         let value = cif.call::<UnTypedAbiValue>(
             libffi::middle::CodePtr::from_ptr(self.code as *const _),
@@ -165,6 +184,8 @@ pub enum JitType {
     Int,
     Float,
     Bool,
+    VmCtxRef,
+    PyRef,
 }
 
 impl JitType {
@@ -173,6 +194,8 @@ impl JitType {
             Self::Int => types::I64,
             Self::Float => types::F64,
             Self::Bool => types::I8,
+            Self::VmCtxRef => types::I64,
+            Self::PyRef => types::I64,
         }
     }
 
@@ -181,6 +204,8 @@ impl JitType {
             Self::Int => libffi::middle::Type::i64(),
             Self::Float => libffi::middle::Type::f64(),
             Self::Bool => libffi::middle::Type::u8(),
+            Self::VmCtxRef => libffi::middle::Type::i64(),
+            Self::PyRef => libffi::middle::Type::i64(),
         }
     }
 }
@@ -191,6 +216,8 @@ pub enum AbiValue {
     Float(f64),
     Int(i64),
     Bool(bool),
+    PyRef(*const ()),
+    VmCtxRef(*const ()),
 }
 
 impl AbiValue {
@@ -199,6 +226,8 @@ impl AbiValue {
             AbiValue::Int(ref i) => libffi::middle::Arg::new(i),
             AbiValue::Float(ref f) => libffi::middle::Arg::new(f),
             AbiValue::Bool(ref b) => libffi::middle::Arg::new(b),
+            AbiValue::PyRef(ref r) => libffi::middle::Arg::new(r),
+            AbiValue::VmCtxRef(ref r) => libffi::middle::Arg::new(r),
         }
     }
 }
@@ -258,7 +287,9 @@ fn type_check(ty: &JitType, val: &AbiValue) -> Result<(), JitArgumentError> {
     match (ty, val) {
         (JitType::Int, AbiValue::Int(_))
         | (JitType::Float, AbiValue::Float(_))
-        | (JitType::Bool, AbiValue::Bool(_)) => Ok(()),
+        | (JitType::Bool, AbiValue::Bool(_))
+        | (JitType::VmCtxRef, AbiValue::VmCtxRef(_))
+        | (JitType::PyRef, AbiValue::PyRef(_)) => Ok(()),
         _ => Err(JitArgumentError::ArgumentTypeMismatch),
     }
 }
@@ -268,6 +299,8 @@ union UnTypedAbiValue {
     float: f64,
     int: i64,
     boolean: u8,
+    py_ref: *const (),
+    vmctx_ref: *const (),
     _void: (),
 }
 
@@ -277,6 +310,8 @@ impl UnTypedAbiValue {
             JitType::Int => AbiValue::Int(self.int),
             JitType::Float => AbiValue::Float(self.float),
             JitType::Bool => AbiValue::Bool(self.boolean != 0),
+            JitType::PyRef => AbiValue::PyRef(self.py_ref),
+            JitType::VmCtxRef => AbiValue::VmCtxRef(self.vmctx_ref),
         }
     }
 }
@@ -301,15 +336,21 @@ impl fmt::Debug for CompiledCode {
 
 pub struct ArgsBuilder<'a> {
     values: Vec<Option<AbiValue>>,
+    vmctx: Option<AbiValue>,
     code: &'a CompiledCode,
 }
 
 impl<'a> ArgsBuilder<'a> {
     fn new(code: &'a CompiledCode) -> ArgsBuilder<'a> {
         ArgsBuilder {
-            values: vec![None; code.sig.args.len()],
+            values: vec![None; code.sig.args.len() - 1],
+            vmctx: None,
             code,
         }
+    }
+
+    pub fn set_vmctx<T>(&mut self, vmctx: &'a T) {
+        self.vmctx = Some(AbiValue::VmCtxRef(vmctx as *const T as *const ()));
     }
 
     pub fn set(&mut self, idx: usize, value: AbiValue) -> Result<(), JitArgumentError> {
@@ -323,18 +364,33 @@ impl<'a> ArgsBuilder<'a> {
     }
 
     pub fn into_args(self) -> Option<Args<'a>> {
-        self.values
+        println!("Into Args");
+        dbg!(&self.vmctx);
+        dbg!(&self.values);
+        self.vmctx
+            .map(|v| Some(v))
             .iter()
+            .chain(self.values.iter())
             .map(|v| v.as_ref().map(AbiValue::to_libffi_arg))
             .collect::<Option<_>>()
             .map(|cif_args| Args {
                 _values: self.values,
-                cif_args,
+                cif_args: dbg!(cif_args),
                 code: self.code,
             })
+
+        // self.values
+        //     .iter()
+        //     .map(|v| v.as_ref().map(AbiValue::to_libffi_arg))
+        //     .collect::<Option<_>>()
+        //     .map(|cif_args| Args {
+        //         _values: self.values,
+        //         cif_args,
+        //         code: self.code,
+        //     })
     }
 }
-
+#[derive(Debug)]
 pub struct Args<'a> {
     _values: Vec<Option<AbiValue>>,
     cif_args: Vec<libffi::middle::Arg>,
@@ -343,6 +399,8 @@ pub struct Args<'a> {
 
 impl<'a> Args<'a> {
     pub fn invoke(&self) -> Option<AbiValue> {
+        println!("The Real Args");
+        dbg!(&self.cif_args);
         unsafe { self.code.invoke_raw(&self.cif_args) }
     }
 }

@@ -274,15 +274,23 @@ impl PyFunction {
     ) -> PyResult {
         #[cfg(feature = "jit")]
         if let Some(jitted_code) = self.jitted_code.get() {
+            println!("JITTEDD!!!!");
+            dbg!(&func_args);
             match jitfunc::get_jit_args(self, &func_args, jitted_code, vm) {
                 Ok(args) => {
+                    println!("!!!! Args");
                     return Ok(args.invoke().to_pyobject(vm));
                 }
-                Err(err) => info!(
-                    "jit: function `{}` is falling back to being interpreted because of the \
+                Err(err) => {
+                    println!("getjitargs_err");
+                    dbg!(&err);
+                    info!(
+                        "jit: function `{}` is falling back to being interpreted because of the \
                     error: {}",
-                    self.code.obj_name, err
-                ),
+                        self.code.obj_name,
+                        dbg!(err)
+                    );
+                }
             }
         }
 
